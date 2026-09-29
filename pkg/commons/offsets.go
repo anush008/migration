@@ -2,11 +2,7 @@ package commons
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -62,17 +58,23 @@ func GetStartOffset(ctx context.Context, migrationOffsetsCollectionName string, 
 		return nil, 0, fmt.Errorf("failed to get offset count: invalid type")
 	}
 
-	offsetIntegerValue, ok := offset.GetKind().(*qdrant.Value_IntegerValue)
-	if ok {
-		return qdrant.NewIDNum(uint64(offsetIntegerValue.IntegerValue)), uint64(offsetCountValue.IntegerValue), nil
+	offsetID := getOffsetIdFromValue(offset)
+	if offsetID == nil {
+		return nil, 0, nil
 	}
+	return offsetID, uint64(offsetCountValue.IntegerValue), nil
+}
 
-	offsetStringValue, ok := offset.GetKind().(*qdrant.Value_StringValue)
-	if ok {
-		return qdrant.NewIDUUID(offsetStringValue.StringValue), uint64(offsetCountValue.IntegerValue), nil
+// getOffsetIdFromValue is the inverse of getOffsetIdAsValue. It returns nil for unsupported values.
+func getOffsetIdFromValue(value *qdrant.Value) *qdrant.PointId {
+	switch v := value.GetKind().(type) {
+	case *qdrant.Value_IntegerValue:
+		return qdrant.NewIDNum(uint64(v.IntegerValue))
+	case *qdrant.Value_StringValue:
+		return qdrant.NewIDUUID(v.StringValue)
+	default:
+		return nil
 	}
-
-	return nil, 0, nil
 }
 
 func getOffsetIdAsValue(offset *qdrant.PointId) (interface{}, error) {
@@ -140,59 +142,32 @@ func getOffsetPointId(sourceCollection string) *qdrant.PointId {
 	return qdrant.NewIDUUID(deterministicUUID.String())
 }
 
-// EncodePointID serializes a point ID into a string that keeps its type ("n:<num>" or "u:<uuid>").
-func EncodePointID(id *qdrant.PointId) (string, error) {
-	switch v := id.GetPointIdOptions().(type) {
-	case *qdrant.PointId_Num:
-		return "n:" + strconv.FormatUint(v.Num, 10), nil
-	case *qdrant.PointId_Uuid:
-		return "u:" + v.Uuid, nil
-	default:
-		return "", fmt.Errorf("unsupported point id type: %T", v)
+// DeleteStartOffsets removes the offsets stored under the given keys.
+func DeleteStartOffsets(ctx context.Context, migrationOffsetsCollectionName string, targetClient *qdrant.Client, keys []string) error {
+	ids := make([]*qdrant.PointId, len(keys))
+	for i, key := range keys {
+		ids[i] = getOffsetPointId(key)
 	}
+	_, err := targetClient.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: migrationOffsetsCollectionName,
+		Wait:           qdrant.PtrOf(true),
+		Points:         qdrant.NewPointsSelector(ids...),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete offsets: %w", err)
+	}
+	return nil
 }
 
-// DecodePointID is the inverse of EncodePointID.
-func DecodePointID(s string) (*qdrant.PointId, error) {
-	switch {
-	case strings.HasPrefix(s, "n:"):
-		n, err := strconv.ParseUint(strings.TrimPrefix(s, "n:"), 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("invalid numeric point id %q: %w", s, err)
-		}
-		return qdrant.NewIDNum(n), nil
-	case strings.HasPrefix(s, "u:"):
-		return qdrant.NewIDUUID(strings.TrimPrefix(s, "u:")), nil
-	default:
-		return nil, fmt.Errorf("invalid encoded point id %q", s)
-	}
-}
-
-// BoundariesFingerprint returns a short, stable identifier of a set of range boundaries.
-// It is used to namespace per-range offsets, so an offset saved for one set of boundaries
-// can never be applied to a different set (which would silently skip points on resume).
-func BoundariesFingerprint(ids []*qdrant.PointId) (string, error) {
-	h := sha256.New()
-	for _, id := range ids {
-		s, err := EncodePointID(id)
-		if err != nil {
-			return "", err
-		}
-		h.Write([]byte(s))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))[:12], nil
-}
-
-// StoreBoundaries persists the range boundaries used by a parallel migration under the given key.
+// StoreBoundaries persists the range boundaries of a parallel migration under the given key.
 func StoreBoundaries(ctx context.Context, migrationOffsetsCollectionName string, targetClient *qdrant.Client, key string, ids []*qdrant.PointId) error {
 	values := make([]any, len(ids))
 	for i, id := range ids {
-		s, err := EncodePointID(id)
+		value, err := getOffsetIdAsValue(id)
 		if err != nil {
 			return err
 		}
-		values[i] = s
+		values[i] = value
 	}
 	_, err := targetClient.Upsert(ctx, &qdrant.UpsertPoints{
 		CollectionName: migrationOffsetsCollectionName,
@@ -211,7 +186,7 @@ func StoreBoundaries(ctx context.Context, migrationOffsetsCollectionName string,
 	return nil
 }
 
-// GetBoundaries loads range boundaries stored by StoreBoundaries. It returns nil if none were stored.
+// GetBoundaries loads the range boundaries stored by StoreBoundaries. It returns nil if none were stored.
 func GetBoundaries(ctx context.Context, migrationOffsetsCollectionName string, targetClient *qdrant.Client, key string) ([]*qdrant.PointId, error) {
 	point, err := getOffsetPoint(ctx, migrationOffsetsCollectionName, targetClient, key)
 	if err != nil {
@@ -220,21 +195,12 @@ func GetBoundaries(ctx context.Context, migrationOffsetsCollectionName string, t
 	if point == nil {
 		return nil, nil
 	}
-	value, ok := point.Payload[key+"_boundaries"]
-	if !ok {
-		return nil, nil
-	}
-	list := value.GetListValue()
-	if list == nil {
-		return nil, fmt.Errorf("stored range boundaries have invalid type")
-	}
-	ids := make([]*qdrant.PointId, 0, len(list.GetValues()))
-	for _, v := range list.GetValues() {
-		id, err := DecodePointID(v.GetStringValue())
-		if err != nil {
-			return nil, err
+	values := point.Payload[key+"_boundaries"].GetListValue().GetValues()
+	ids := make([]*qdrant.PointId, len(values))
+	for i, value := range values {
+		if ids[i] = getOffsetIdFromValue(value); ids[i] == nil {
+			return nil, fmt.Errorf("invalid stored range boundary: %v", value)
 		}
-		ids = append(ids, id)
 	}
 	return ids, nil
 }

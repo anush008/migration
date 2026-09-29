@@ -168,9 +168,7 @@ func DecodePointID(s string) (*qdrant.PointId, error) {
 	}
 }
 
-// BoundariesFingerprint returns a short, stable identifier of a set of range boundaries.
-// It is used to namespace per-range offsets, so an offset saved for one set of boundaries
-// can never be applied to a different set (which would silently skip points on resume).
+// BoundariesFingerprint returns a short hash identifying a set of range boundaries.
 func BoundariesFingerprint(ids []*qdrant.PointId) (string, error) {
 	h := sha256.New()
 	for _, id := range ids {
@@ -184,7 +182,7 @@ func BoundariesFingerprint(ids []*qdrant.PointId) (string, error) {
 	return hex.EncodeToString(h.Sum(nil))[:12], nil
 }
 
-// StoreBoundaries persists the range boundaries used by a parallel migration under the given key.
+// StoreBoundaries stores the range boundaries of a parallel migration under the given key.
 func StoreBoundaries(ctx context.Context, migrationOffsetsCollectionName string, targetClient *qdrant.Client, key string, ids []*qdrant.PointId) error {
 	values := make([]any, len(ids))
 	for i, id := range ids {
@@ -211,7 +209,7 @@ func StoreBoundaries(ctx context.Context, migrationOffsetsCollectionName string,
 	return nil
 }
 
-// GetBoundaries loads range boundaries stored by StoreBoundaries. It returns nil if none were stored.
+// GetBoundaries returns the range boundaries stored by StoreBoundaries, or nil if there are none.
 func GetBoundaries(ctx context.Context, migrationOffsetsCollectionName string, targetClient *qdrant.Client, key string) ([]*qdrant.PointId, error) {
 	point, err := getOffsetPoint(ctx, migrationOffsetsCollectionName, targetClient, key)
 	if err != nil {

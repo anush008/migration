@@ -6,26 +6,41 @@ import (
 	"github.com/qdrant/go-client/qdrant"
 )
 
-func TestOffsetIdValueRoundTrip(t *testing.T) {
+func TestPointIDRoundTrip(t *testing.T) {
 	for _, id := range []*qdrant.PointId{
 		qdrant.NewIDNum(0),
 		qdrant.NewIDNum(18446744073709551615),
 		qdrant.NewIDUUID("0f4a6de3-c18b-5de3-992b-5eb7f5c52b1a"),
 	} {
-		v, err := getOffsetIdAsValue(id)
+		s, err := EncodePointID(id)
 		if err != nil {
-			t.Fatalf("to value %v: %v", id, err)
+			t.Fatalf("encode %v: %v", id, err)
 		}
-		value, err := qdrant.NewValue(v)
+		got, err := DecodePointID(s)
 		if err != nil {
-			t.Fatalf("new value %v: %v", v, err)
+			t.Fatalf("decode %q: %v", s, err)
 		}
-		got := getOffsetIdFromValue(value)
 		if got.GetNum() != id.GetNum() || got.GetUuid() != id.GetUuid() {
 			t.Fatalf("round trip mismatch: %v != %v", got, id)
 		}
 	}
-	if getOffsetIdFromValue(qdrant.NewValueBool(true)) != nil {
-		t.Fatal("expected nil for unsupported value")
+	if _, err := DecodePointID("x:1"); err == nil {
+		t.Fatal("expected error for invalid encoding")
+	}
+}
+
+func TestBoundariesFingerprint(t *testing.T) {
+	a := []*qdrant.PointId{qdrant.NewIDNum(1), qdrant.NewIDNum(5)}
+	b := []*qdrant.PointId{qdrant.NewIDNum(1), qdrant.NewIDNum(5)}
+	c := []*qdrant.PointId{qdrant.NewIDNum(1), qdrant.NewIDNum(6)}
+
+	fa, _ := BoundariesFingerprint(a)
+	fb, _ := BoundariesFingerprint(b)
+	fc, _ := BoundariesFingerprint(c)
+	if fa != fb {
+		t.Fatalf("same boundaries must give the same fingerprint: %s != %s", fa, fb)
+	}
+	if fa == fc {
+		t.Fatalf("different boundaries must give different fingerprints: %s == %s", fa, fc)
 	}
 }

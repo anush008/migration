@@ -67,3 +67,14 @@ func TestChromaRequestRetriesWithAuth(t *testing.T) {
 	require.Equal(t, []int{http.StatusServiceUnavailable, http.StatusOK}, statuses)
 	require.Equal(t, []string{"Bearer secret", "Bearer secret"}, headers)
 }
+
+func TestChromaPointID(t *testing.T) {
+	u := "550e8400-e29b-41d4-a716-446655440000"
+	require.Equal(t, qdrant.NewIDUUID(u), chromaPointID(u))
+
+	ids := map[string]bool{}
+	for _, id := range []string{u, "550E8400-E29B-41D4-A716-446655440000", "{" + u + "}", "550e8400e29b41d4a716446655440000", "urn:uuid:" + u} {
+		ids[chromaPointID(id).GetUuid()] = true
+	}
+	require.Len(t, ids, 5)
+}

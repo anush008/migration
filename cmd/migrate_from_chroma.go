@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pterm/pterm"
 
 	"github.com/qdrant/go-client/qdrant"
@@ -72,6 +73,10 @@ func (r *MigrateFromChromaCmd) Parse() error {
 		return fmt.Errorf("failed to parse target URL: %w", err)
 	}
 
+	chromaURL, err := url.Parse(r.Chroma.Url)
+	if err != nil || (chromaURL.Scheme != "http" && chromaURL.Scheme != "https") || chromaURL.Host == "" {
+		return fmt.Errorf("invalid Chroma URL %q, expected http://host:port or https://host:port", r.Chroma.Url)
+	}
 	r.Chroma.Url = strings.TrimRight(r.Chroma.Url, "/")
 
 	return nil
@@ -371,7 +376,7 @@ func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chro
 			}
 
 			targetPoints = append(targetPoints, &qdrant.PointStruct{
-				Id:      arbitraryIDToUUID(id),
+				Id:      chromaPointID(id),
 				Vectors: qdrant.NewVectorsDense(resp.Embeddings[i]),
 				Payload: qdrantPayload,
 			})
@@ -396,10 +401,6 @@ func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chro
 		}
 
 		bar.Add(count)
-
-		if count < batchSize {
-			break
-		}
 
 		// Apply batch delay if configured (helps with rate limiting)
 		if r.Migration.BatchDelay > 0 {
@@ -426,4 +427,14 @@ func convertChromaValue(value any) any {
 		}
 	}
 	return value
+}
+
+// chromaPointID keeps IDs that are lowercase canonical UUIDs and hashes all other IDs.
+// Chroma IDs are case-sensitive strings, so IDs such as an uppercase UUID and its lowercase form
+// are different records, while Qdrant would store both as the same UUID.
+func chromaPointID(id string) *qdrant.PointId {
+	if parsed, err := uuid.Parse(id); err == nil && parsed.String() == id {
+		return qdrant.NewIDUUID(id)
+	}
+	return qdrant.NewIDUUID(uuid.NewSHA1(uuid.NameSpaceURL, []byte(id)).String())
 }

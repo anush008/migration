@@ -16,7 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pterm/pterm"
 
 	"github.com/qdrant/go-client/qdrant"
@@ -376,7 +375,7 @@ func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chro
 			}
 
 			targetPoints = append(targetPoints, &qdrant.PointStruct{
-				Id:      chromaPointID(id),
+				Id:      arbitraryIDToUUID(id),
 				Vectors: qdrant.NewVectorsDense(resp.Embeddings[i]),
 				Payload: qdrantPayload,
 			})
@@ -427,14 +426,4 @@ func convertChromaValue(value any) any {
 		}
 	}
 	return value
-}
-
-// chromaPointID keeps IDs that are lowercase canonical UUIDs and hashes all other IDs.
-// Chroma IDs are case-sensitive strings, so IDs such as an uppercase UUID and its lowercase form
-// are different records, while Qdrant would store both as the same UUID.
-func chromaPointID(id string) *qdrant.PointId {
-	if parsed, err := uuid.Parse(id); err == nil && parsed.String() == id {
-		return qdrant.NewIDUUID(id)
-	}
-	return qdrant.NewIDUUID(uuid.NewSHA1(uuid.NameSpaceURL, []byte(id)).String())
 }

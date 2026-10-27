@@ -55,6 +55,18 @@ type chromaCollection struct {
 		Hnsw  *chromaSpaceConfig `json:"hnsw"`
 		Spann *chromaSpaceConfig `json:"spann"`
 	} `json:"configuration_json"`
+	Schema *struct {
+		Keys map[string]struct {
+			SparseVector *struct {
+				SparseVectorIndex *struct {
+					Enabled bool `json:"enabled"`
+					Config  struct {
+						BM25 bool `json:"bm25"`
+					} `json:"config"`
+				} `json:"sparse_vector_index"`
+			} `json:"sparse_vector"`
+		} `json:"keys"`
+	} `json:"schema"`
 }
 
 type chromaGetResponse struct {
@@ -140,14 +152,16 @@ func (r *MigrateFromChromaCmd) Run(globals *Globals) error {
 		return fmt.Errorf("failed to count points in source: %w", err)
 	}
 
-	err = r.prepareTargetCollection(ctx, &collection, targetClient)
+	sparseVectors := collection.sparseVectors()
+
+	err = r.prepareTargetCollection(ctx, &collection, sparseVectors, targetClient)
 	if err != nil {
 		return fmt.Errorf("error preparing target collection: %w", err)
 	}
 
 	displayMigrationStart("chroma", r.Chroma.Collection, r.Qdrant.Collection)
 
-	err = r.migrateData(ctx, &collection, targetClient, sourcePointCount)
+	err = r.migrateData(ctx, &collection, sparseVectors, targetClient, sourcePointCount)
 	if err != nil {
 		return fmt.Errorf("failed to migrate data: %w", err)
 	}
@@ -262,7 +276,27 @@ func (c *chromaCollection) distance() (qdrant.Distance, error) {
 	}
 }
 
-func (r *MigrateFromChromaCmd) prepareTargetCollection(ctx context.Context, collection *chromaCollection, targetClient *qdrant.Client) error {
+// sparseVectors returns the metadata keys that have a Chroma sparse vector index.
+// BM25 sparse vectors get the IDF modifier, because Chroma applies IDF to them at query time.
+func (c *chromaCollection) sparseVectors() map[string]*qdrant.SparseVectorParams {
+	sparseVectors := make(map[string]*qdrant.SparseVectorParams)
+	if c.Schema == nil {
+		return sparseVectors
+	}
+	for key, valueTypes := range c.Schema.Keys {
+		if valueTypes.SparseVector == nil || valueTypes.SparseVector.SparseVectorIndex == nil || !valueTypes.SparseVector.SparseVectorIndex.Enabled {
+			continue
+		}
+		params := &qdrant.SparseVectorParams{}
+		if valueTypes.SparseVector.SparseVectorIndex.Config.BM25 {
+			params.Modifier = qdrant.Modifier_Idf.Enum()
+		}
+		sparseVectors[key] = params
+	}
+	return sparseVectors
+}
+
+func (r *MigrateFromChromaCmd) prepareTargetCollection(ctx context.Context, collection *chromaCollection, sparseVectors map[string]*qdrant.SparseVectorParams, targetClient *qdrant.Client) error {
 	if !r.Migration.CreateCollection {
 		return nil
 	}
@@ -299,6 +333,9 @@ func (r *MigrateFromChromaCmd) prepareTargetCollection(ctx context.Context, coll
 			Distance: distance,
 		}),
 	}
+	if len(sparseVectors) > 0 {
+		createReq.SparseVectorsConfig = qdrant.NewSparseVectorsConfig(sparseVectors)
+	}
 
 	if err := targetClient.CreateCollection(ctx, createReq); err != nil {
 		return fmt.Errorf("failed to create target collection: %w", err)
@@ -308,7 +345,7 @@ func (r *MigrateFromChromaCmd) prepareTargetCollection(ctx context.Context, coll
 	return nil
 }
 
-func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chromaCollection, targetClient *qdrant.Client, sourcePointCount uint64) error {
+func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chromaCollection, sparseVectors map[string]*qdrant.SparseVectorParams, targetClient *qdrant.Client, sourcePointCount uint64) error {
 	batchSize := r.Migration.BatchSize
 
 	var currentOffset uint64 = 0
@@ -348,13 +385,21 @@ func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chro
 		targetPoints := make([]*qdrant.PointStruct, 0, count)
 		for i, id := range resp.IDs {
 			payload := make(map[string]any)
+			vectors := map[string]*qdrant.Vector{"": qdrant.NewVectorDense(resp.Embeddings[i])}
 			for key, value := range resp.Metadatas[i] {
 				if key == r.IdField || key == r.DocumentField || key == r.UriField {
 					return fmt.Errorf("metadata key %q of record %q has the name of an ID, document or URI field, set --qdrant.id-field, --qdrant.document-field or --qdrant.uri-field to another name", key, id)
 				}
+				// Objects in Chroma metadata are sparse vectors.
 				if _, ok := value.(map[string]any); ok {
-					if !skippedSparseVectors {
-						pterm.Warning.Printfln("Skipping sparse vector metadata, such as '%s', because sparse vectors are not migrated", key)
+					if _, indexed := sparseVectors[key]; indexed {
+						vector, err := chromaSparseVector(value)
+						if err != nil {
+							return fmt.Errorf("invalid sparse vector %q of record %q: %w", key, id, err)
+						}
+						vectors[key] = vector
+					} else if !skippedSparseVectors {
+						pterm.Warning.Printfln("Skipping sparse vectors without a sparse vector index, such as '%s'", key)
 						skippedSparseVectors = true
 					}
 					continue
@@ -376,7 +421,7 @@ func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chro
 
 			targetPoints = append(targetPoints, &qdrant.PointStruct{
 				Id:      arbitraryIDToUUID(id),
-				Vectors: qdrant.NewVectorsDense(resp.Embeddings[i]),
+				Vectors: qdrant.NewVectorsMap(vectors),
 				Payload: qdrantPayload,
 			})
 		}
@@ -426,4 +471,22 @@ func convertChromaValue(value any) any {
 		}
 	}
 	return value
+}
+
+func chromaSparseVector(value any) (*qdrant.Vector, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var sparse struct {
+		Indices []uint32  `json:"indices"`
+		Values  []float32 `json:"values"`
+	}
+	if err := json.Unmarshal(data, &sparse); err != nil {
+		return nil, err
+	}
+	if len(sparse.Indices) != len(sparse.Values) {
+		return nil, fmt.Errorf("%d indices and %d values", len(sparse.Indices), len(sparse.Values))
+	}
+	return qdrant.NewVectorSparse(sparse.Indices, sparse.Values), nil
 }

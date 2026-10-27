@@ -390,8 +390,10 @@ func (r *MigrateFromChromaCmd) migrateData(ctx context.Context, collection *chro
 				if key == r.IdField || key == r.DocumentField || key == r.UriField {
 					return fmt.Errorf("metadata key %q of record %q has the name of an ID, document or URI field, set --qdrant.id-field, --qdrant.document-field or --qdrant.uri-field to another name", key, id)
 				}
-				// Objects in Chroma metadata are sparse vectors.
-				if _, ok := value.(map[string]any); ok {
+				if object, ok := value.(map[string]any); ok {
+					if object["#type"] != "sparse_vector" {
+						return fmt.Errorf("unsupported metadata value %q of record %q", key, id)
+					}
 					if _, indexed := sparseVectors[key]; indexed {
 						vector, err := chromaSparseVector(value)
 						if err != nil {
@@ -484,6 +486,9 @@ func chromaSparseVector(value any) (*qdrant.Vector, error) {
 	}
 	if err := json.Unmarshal(data, &sparse); err != nil {
 		return nil, err
+	}
+	if sparse.Indices == nil || sparse.Values == nil {
+		return nil, errors.New("missing indices or values")
 	}
 	if len(sparse.Indices) != len(sparse.Values) {
 		return nil, fmt.Errorf("%d indices and %d values", len(sparse.Indices), len(sparse.Values))

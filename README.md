@@ -71,7 +71,7 @@ docker run --net=host --rm -it registry.cloud.qdrant.io/library/qdrant-migration
     --migration.batch-size 64
 ```
 
-For Chroma Cloud, set `--chroma.url 'https://api.trychroma.com'`, `--chroma.tenant`, `--chroma.database`, and `--chroma.auth-type token --chroma.token-header X-Chroma-Token --chroma.token 'your-api-key'`.
+For Chroma Cloud, set `--chroma.url 'https://api.trychroma.com'`, `--chroma.tenant`, `--chroma.database`, and `--chroma.auth-type token --chroma.token-header X-Chroma-Token --chroma.token 'your-api-key'`. Chroma Cloud returns at most 300 records per request, so keep `--migration.batch-size` at 300 or lower.
 
 Sparse vectors of keys with a Chroma sparse vector index are migrated as [sparse vectors](https://qdrant.tech/documentation/concepts/vectors/#sparse-vectors) with the same name. BM25 sparse vectors use the `idf` modifier.
 

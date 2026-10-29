@@ -27,7 +27,7 @@ type MigrateFromPineconeCmd struct {
 	Qdrant       commons.QdrantConfig    `embed:"" prefix:"qdrant."`
 	Migration    commons.MigrationConfig `embed:"" prefix:"migration."`
 	IdField      string                  `prefix:"qdrant." help:"Field storing Pinecone IDs in Qdrant." default:"__id__"`
-	SparseVector string                  `prefix:"qdrant." help:"Name of the sparse vector in Qdrant" default:"sparse_vector"`
+	SparseVector string                  `prefix:"qdrant." help:"Name of the sparse vector in Qdrant, for indexes without a document schema" default:"sparse_vector"`
 
 	targetHost string
 	targetPort int
@@ -80,14 +80,29 @@ func (r *MigrateFromPineconeCmd) Run(globals *Globals) error {
 		return fmt.Errorf("failed to count points in source: %w", err)
 	}
 
-	err = r.prepareTargetCollection(ctx, sourceClient, targetClient)
-	if err != nil {
-		return fmt.Errorf("error preparing target collection: %w", err)
+	// Indexes with a document schema need the documents API. A failed description leaves the vectors API,
+	// which every index supported before API version 2026-07.
+	var plan *pineconeDocumentPlan
+	if description, err := r.describeIndex(ctx); err != nil {
+		pterm.Warning.Printfln("%v. Reading the index with the vectors API.", err)
+	} else {
+		plan = r.documentPlan(description)
 	}
-
-	displayMigrationStart("pinecone", r.Pinecone.IndexHost, r.Qdrant.Collection)
-
-	err = r.migrateData(ctx, sourceIndexConn, targetClient, sourcePointCount)
+	if plan != nil {
+		err = r.prepareDocumentCollection(ctx, plan, targetClient)
+		if err != nil {
+			return fmt.Errorf("error preparing target collection: %w", err)
+		}
+		displayMigrationStart("pinecone", r.Pinecone.IndexName, r.Qdrant.Collection)
+		err = r.migrateDocuments(ctx, plan, targetClient, sourcePointCount)
+	} else {
+		err = r.prepareTargetCollection(ctx, sourceClient, targetClient)
+		if err != nil {
+			return fmt.Errorf("error preparing target collection: %w", err)
+		}
+		displayMigrationStart("pinecone", r.Pinecone.IndexName, r.Qdrant.Collection)
+		err = r.migrateData(ctx, sourceIndexConn, targetClient, sourcePointCount)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to migrate data: %w", err)
 	}

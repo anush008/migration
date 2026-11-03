@@ -54,8 +54,8 @@ func TestMigrateFromPineconeDocuments(t *testing.T) {
 		} `json:"status"`
 	}
 	require.Eventually(t, func() bool {
-		pineconeAPI(ctx, t, apiKey, http.MethodGet, pineconeControlPlane+"/indexes/"+indexName, nil, &index)
-		return index.Status.Ready
+		err := pineconeTry(ctx, apiKey, http.MethodGet, pineconeControlPlane+"/indexes/"+indexName, nil, &index)
+		return err == nil && index.Status.Ready
 	}, 5*time.Minute, 2*time.Second, "index %q is not ready", indexName)
 
 	// Only documents with an even number have a sparse vector.
@@ -83,8 +83,8 @@ func TestMigrateFromPineconeDocuments(t *testing.T) {
 		var stats struct {
 			TotalVectorCount int `json:"totalVectorCount"`
 		}
-		pineconeAPI(ctx, t, apiKey, http.MethodPost, "https://"+index.Host+"/describe_index_stats", map[string]any{}, &stats)
-		return stats.TotalVectorCount == totalEntries
+		err := pineconeTry(ctx, apiKey, http.MethodPost, "https://"+index.Host+"/describe_index_stats", map[string]any{}, &stats)
+		return err == nil && stats.TotalVectorCount == totalEntries
 	}, 2*time.Minute, 2*time.Second, "the documents of index %q are not readable", indexName)
 
 	qdrantClient, qdrantHost, qdrantPort := startQdrant(ctx, t)
@@ -174,14 +174,12 @@ func TestMigrateFromPineconeVectors(t *testing.T) {
 	require.NoError(t, err)
 	index, err := client.DescribeIndex(ctx, indexName)
 	require.NoError(t, err)
+	require.NotNil(t, index.Dimension, "index %q must have %d dimensions", indexName, dimension)
 	require.Equal(t, int32(dimension), *index.Dimension, "index %q must have %d dimensions", indexName, dimension)
 
 	namespace := fmt.Sprintf("migration-test-%d", rand.Int())
 	indexConn, err := client.Index(pinecone.NewIndexConnParams{Host: index.Host, Namespace: namespace})
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, indexConn.DeleteAllVectorsInNamespace(context.WithoutCancel(ctx)))
-	})
 
 	ids := make([]string, totalEntries)
 	vectors := make([]*pinecone.Vector, totalEntries)
@@ -194,10 +192,15 @@ func TestMigrateFromPineconeVectors(t *testing.T) {
 	}
 	_, err = indexConn.UpsertVectors(ctx, vectors)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, indexConn.DeleteAllVectorsInNamespace(context.WithoutCancel(ctx)))
+	})
 
 	require.Eventually(t, func() bool {
 		stats, err := indexConn.DescribeIndexStats(ctx)
-		require.NoError(t, err)
+		if err != nil {
+			return false
+		}
 		summary, ok := stats.Namespaces[namespace]
 		return ok && summary.VectorCount == totalEntries
 	}, 2*time.Minute, 2*time.Second, "the vectors of namespace %q are not readable", namespace)
@@ -271,25 +274,41 @@ func startQdrant(ctx context.Context, t *testing.T) (*qdrant.Client, string, int
 // support for indexes with a document schema.
 func pineconeAPI(ctx context.Context, t *testing.T, apiKey, method, url string, body, out any) {
 	t.Helper()
+	require.NoError(t, pineconeTry(ctx, apiKey, method, url, body, out))
+}
+
+// pineconeTry returns the error instead of failing the test, for conditions that poll Pinecone.
+func pineconeTry(ctx context.Context, apiKey, method, url string, body, out any) error {
 	var reader io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)
-		require.NoError(t, err)
+		if err != nil {
+			return err
+		}
 		reader = bytes.NewReader(payload)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, url, reader)
-	require.NoError(t, err)
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Api-Key", apiKey)
 	req.Header.Set("X-Pinecone-API-Version", pineconeAPIVersion)
 	req.Header.Set("Content-Type", "application/json")
 
 	res, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
+	if err != nil {
+		return err
+	}
 	defer res.Body.Close()
 	data, err := io.ReadAll(res.Body)
-	require.NoError(t, err)
-	require.Less(t, res.StatusCode, 300, "%s %s returned status %d: %s", method, url, res.StatusCode, data)
-	if out != nil {
-		require.NoError(t, json.Unmarshal(data, out))
+	if err != nil {
+		return err
 	}
+	if res.StatusCode >= 300 {
+		return fmt.Errorf("%s %s returned status %d: %s", method, url, res.StatusCode, data)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.Unmarshal(data, out)
 }

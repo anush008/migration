@@ -67,9 +67,8 @@ type pineconeVectorField struct {
 }
 
 type pineconeDocumentPlan struct {
-	Vectors  []pineconeVectorField
-	Text     []string
-	Embedded bool
+	Vectors []pineconeVectorField
+	Text    []string
 }
 
 // documentPlan returns nil for an index without a document schema, which the vectors API serves.
@@ -128,9 +127,6 @@ func (r *MigrateFromPineconeCmd) documentPlan(description *pineconeIndexDescript
 			v.Name = v.Field + "_sparse"
 		}
 		plan.Vectors = append(plan.Vectors, v)
-	}
-	for _, v := range plan.Vectors {
-		plan.Embedded = plan.Embedded || v.Embed != nil
 	}
 	return plan
 }
@@ -221,7 +217,7 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 	pageToken := ""
 	offsetCount := uint64(0)
 	if !r.Migration.Restart {
-		id, stored, err := commons.GetStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.Pinecone.IndexHost)
+		id, stored, err := commons.GetStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.progressKey())
 		if err != nil {
 			return fmt.Errorf("failed to get start offset: %w", err)
 		}
@@ -287,7 +283,7 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 			next = list.Pagination.Next
 		}
 		if next != "" {
-			if err := commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.Pinecone.IndexHost, qdrant.NewID(next), offsetCount); err != nil {
+			if err := commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.progressKey(), qdrant.NewID(next), offsetCount); err != nil {
 				return fmt.Errorf("failed to store offset: %w", err)
 			}
 		}
@@ -535,7 +531,8 @@ func (r *MigrateFromPineconeCmd) pineconeRequestOnce(ctx context.Context, method
 	client := &http.Client{Timeout: 2 * time.Minute}
 	res, err := client.Do(req)
 	if err != nil {
-		return true, err
+		// Pinecone may have embedded the texts of a request whose response was lost, so a retry uses the quota again.
+		return !strings.HasSuffix(req.URL.Path, "/embed"), err
 	}
 	defer res.Body.Close()
 	data, err := io.ReadAll(res.Body)

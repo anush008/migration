@@ -32,7 +32,7 @@ func TestPineconeDocumentPlan(t *testing.T) {
 	require.Len(t, plan.Vectors, 1)
 	require.Equal(t, "chunk_text", plan.Vectors[0].Name, "one dense vector takes the name of its field")
 	require.Equal(t, uint64(1024), plan.Vectors[0].Size)
-	require.True(t, plan.Embedded)
+	require.NotNil(t, plan.Vectors[0].Embed)
 
 	plan = r.documentPlan(parseDescription(t, `{"schema": {"fields": {
 		"a": {"type": "dense_vector", "dimension": 3, "metric": "dotproduct"},
@@ -41,7 +41,7 @@ func TestPineconeDocumentPlan(t *testing.T) {
 	}}}`))
 	require.NotNil(t, plan)
 	require.Equal(t, []string{"a", "b", "s"}, []string{plan.Vectors[0].Name, plan.Vectors[1].Name, plan.Vectors[2].Name})
-	require.False(t, plan.Embedded)
+	require.Nil(t, plan.Vectors[0].Embed)
 
 	plan = r.documentPlan(parseDescription(t, `{"schema": {"fields": {
 		"chunk_text": {"type": "string",

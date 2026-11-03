@@ -80,10 +80,13 @@ func (r *MigrateFromPineconeCmd) Run(globals *Globals) error {
 		return fmt.Errorf("failed to count points in source: %w", err)
 	}
 
-	// Indexes with a document schema need the documents API. A failed description leaves the vectors API,
-	// which every index supported before API version 2026-07.
+	// Indexes with a document schema need the documents API. With a custom service host, such as Pinecone Local,
+	// a failed description leaves the vectors API, which every index supported before API version 2026-07.
 	var plan *pineconeDocumentPlan
 	if description, err := r.describeIndex(ctx); err != nil {
+		if r.Pinecone.ServiceHost == "" {
+			return err
+		}
 		pterm.Warning.Printfln("%v. Reading the index with the vectors API.", err)
 	} else {
 		plan = r.documentPlan(description)
@@ -151,7 +154,24 @@ func (r *MigrateFromPineconeCmd) countPineconeVectors(ctx context.Context, index
 		return 0, fmt.Errorf("failed to get index statistics: %w", err)
 	}
 
-	return uint64(stats.TotalVectorCount), nil
+	// Pinecone names the default namespace "" or "__default__", depending on the API version.
+	for _, namespace := range []string{r.Pinecone.Namespace, pineconeDefaultNamespace} {
+		if summary, ok := stats.Namespaces[namespace]; ok {
+			return uint64(summary.VectorCount), nil
+		}
+		if r.Pinecone.Namespace != "" {
+			break
+		}
+	}
+	return 0, nil
+}
+
+// progressKey identifies the saved progress of one namespace. The default namespace keeps the index host as its key.
+func (r *MigrateFromPineconeCmd) progressKey() string {
+	if r.Pinecone.Namespace == "" {
+		return r.Pinecone.IndexHost
+	}
+	return r.Pinecone.IndexHost + "/" + r.Pinecone.Namespace
 }
 
 func (r *MigrateFromPineconeCmd) prepareTargetCollection(ctx context.Context, sourceClient *pinecone.Client, targetClient *qdrant.Client) error {
@@ -229,7 +249,7 @@ func (r *MigrateFromPineconeCmd) migrateData(ctx context.Context, sourceIndexCon
 	offsetCount := uint64(0)
 
 	if !r.Migration.Restart {
-		id, offsetStored, err := commons.GetStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.Pinecone.IndexHost)
+		id, offsetStored, err := commons.GetStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.progressKey())
 		if err != nil {
 			return fmt.Errorf("failed to get start offset: %w", err)
 		}
@@ -314,7 +334,7 @@ func (r *MigrateFromPineconeCmd) migrateData(ctx context.Context, sourceIndexCon
 		if listRes.NextPaginationToken != nil {
 			offsetCount += uint64(len(targetPoints))
 			offsetId = qdrant.NewID(*listRes.NextPaginationToken)
-			err = commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.Pinecone.IndexHost, offsetId, offsetCount)
+			err = commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.progressKey(), offsetId, offsetCount)
 			if err != nil {
 				return fmt.Errorf("failed to store offset: %w", err)
 			}

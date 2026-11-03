@@ -27,58 +27,49 @@ const (
 
 // Each test creates its own Pinecone index and deletes it after the test.
 
-func TestMigrateFromPineconeDense(t *testing.T) {
+// TestMigrateFromPineconeVectors reads a dense and a sparse index through the vectors API.
+func TestMigrateFromPineconeVectors(t *testing.T) {
 	ctx := context.Background()
 	apiKey := pineconeAPIKey(t)
 	client, err := pinecone.NewClient(pinecone.NewClientParams{ApiKey: apiKey})
 	require.NoError(t, err)
-	index := createVectorIndex(ctx, t, client, "dense", pinecone.Euclidean)
 
-	// A namespace other than the default one checks --pinecone.namespace.
-	namespace := "migration-test"
-	indexConn, err := client.Index(pinecone.NewIndexConnParams{Host: index.Host, Namespace: namespace})
-	require.NoError(t, err)
-	ids, vectors := createTestData(t, false)
-	_, err = indexConn.UpsertVectors(ctx, vectors)
-	require.NoError(t, err)
-	waitForVectors(ctx, t, indexConn, namespace)
+	for _, tc := range []struct {
+		vectorType string
+		metric     pinecone.IndexMetric
+		namespace  string
+	}{
+		// A namespace other than the default one checks --pinecone.namespace.
+		{"dense", pinecone.Euclidean, "migration-test"},
+		{"sparse", pinecone.Dotproduct, ""},
+	} {
+		t.Run(tc.vectorType, func(t *testing.T) {
+			index := createVectorIndex(ctx, t, client, tc.vectorType, tc.metric)
+			indexConn, err := client.Index(pinecone.NewIndexConnParams{Host: index.Host, Namespace: tc.namespace})
+			require.NoError(t, err)
+			ids, vectors := createTestData(t, tc.vectorType == "sparse")
+			_, err = indexConn.UpsertVectors(ctx, vectors)
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				stats, err := indexConn.DescribeIndexStats(ctx)
+				return err == nil && stats.Namespaces[tc.namespace] != nil && stats.Namespaces[tc.namespace].VectorCount == totalEntries
+			}, 2*time.Minute, 2*time.Second, "the vectors of index %q are not readable", index.Name)
 
-	qdrantClient, qdrantHost, qdrantPort := startQdrant(ctx, t)
-	runMigrationBinary(t, pineconeArgs(apiKey, index.Name, index.Host, qdrantHost, qdrantPort, "--pinecone.namespace="+namespace))
+			qdrantClient, qdrantHost, qdrantPort := startQdrant(ctx, t)
+			runMigrationBinary(t, pineconeArgs(apiKey, index.Name, index.Host, qdrantHost, qdrantPort, "--pinecone.namespace="+tc.namespace))
 
-	points := scrollPoints(ctx, t, qdrantClient)
-	for i, id := range ids {
-		point, ok := points[id]
-		require.True(t, ok, "point for vector %q not found", id)
-		require.Equal(t, vectors[i].Metadata.Fields["source"].GetStringValue(), point.Payload["source"].GetStringValue())
-		require.InDeltaSlice(t, *vectors[i].Values, point.Vectors.GetVector().GetDenseVector().GetData(), 1e-6)
-	}
-}
-
-func TestMigrateFromPineconeSparse(t *testing.T) {
-	ctx := context.Background()
-	apiKey := pineconeAPIKey(t)
-	client, err := pinecone.NewClient(pinecone.NewClientParams{ApiKey: apiKey})
-	require.NoError(t, err)
-	index := createVectorIndex(ctx, t, client, "sparse", pinecone.Dotproduct)
-
-	indexConn, err := client.Index(pinecone.NewIndexConnParams{Host: index.Host})
-	require.NoError(t, err)
-	ids, vectors := createTestData(t, true)
-	_, err = indexConn.UpsertVectors(ctx, vectors)
-	require.NoError(t, err)
-	waitForVectors(ctx, t, indexConn, "")
-
-	qdrantClient, qdrantHost, qdrantPort := startQdrant(ctx, t)
-	runMigrationBinary(t, pineconeArgs(apiKey, index.Name, index.Host, qdrantHost, qdrantPort))
-
-	points := scrollPoints(ctx, t, qdrantClient)
-	for i, id := range ids {
-		point, ok := points[id]
-		require.True(t, ok, "point for vector %q not found", id)
-		require.Equal(t, vectors[i].Metadata.Fields["source"].GetStringValue(), point.Payload["source"].GetStringValue())
-		requireSparseEqual(t, vectors[i].SparseValues.Indices, vectors[i].SparseValues.Values,
-			point.Vectors.GetVectors().GetVectors()[sparseVectorName].GetSparseVector())
+			points := scrollPoints(ctx, t, qdrantClient)
+			for i, id := range ids {
+				point, ok := points[id]
+				require.True(t, ok, "point for vector %q not found", id)
+				require.Equal(t, vectors[i].Metadata.Fields["source"].GetStringValue(), point.Payload["source"].GetStringValue())
+				if sparse := vectors[i].SparseValues; sparse != nil {
+					requireSparseEqual(t, sparse.Indices, sparse.Values, point.Vectors.GetVectors().GetVectors()[sparseVectorName].GetSparseVector())
+				} else {
+					require.InDeltaSlice(t, *vectors[i].Values, point.Vectors.GetVector().GetDenseVector().GetData(), 1e-6)
+				}
+			}
+		})
 	}
 }
 
@@ -215,18 +206,6 @@ func createVectorIndex(ctx context.Context, t *testing.T, client *pinecone.Clien
 		return err == nil && index.Status.Ready
 	}, 5*time.Minute, 2*time.Second, "index %q is not ready", request.Name)
 	return index
-}
-
-func waitForVectors(ctx context.Context, t *testing.T, indexConn *pinecone.IndexConnection, namespace string) {
-	t.Helper()
-	require.Eventually(t, func() bool {
-		stats, err := indexConn.DescribeIndexStats(ctx)
-		if err != nil {
-			return false
-		}
-		summary := stats.Namespaces[namespace]
-		return summary != nil && summary.VectorCount == totalEntries
-	}, 2*time.Minute, 2*time.Second, "the vectors of namespace %q are not readable", namespace)
 }
 
 func pineconeArgs(apiKey, indexName, indexHost, qdrantHost string, qdrantPort int, extra ...string) []string {

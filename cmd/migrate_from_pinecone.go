@@ -80,30 +80,27 @@ func (r *MigrateFromPineconeCmd) Run(globals *Globals) error {
 		return fmt.Errorf("failed to count points in source: %w", err)
 	}
 
-	// Indexes with a document schema need the documents API. With a custom service host, such as Pinecone Local,
-	// a failed description leaves the vectors API, which every index supported before API version 2026-07.
-	var plan *pineconeDocumentPlan
-	if description, err := r.describeIndex(ctx); err != nil {
-		if r.Pinecone.ServiceHost == "" {
-			return err
-		}
-		pterm.Warning.Printfln("%v. Reading the index with the vectors API.", err)
-	} else {
-		plan = r.documentPlan(description)
+	// Indexes with a document schema need the documents API.
+	description, err := r.describeIndex(ctx)
+	if err != nil {
+		return err
 	}
+	plan := r.documentPlan(description)
+
 	if plan != nil {
 		err = r.prepareDocumentCollection(ctx, plan, targetClient)
-		if err != nil {
-			return fmt.Errorf("error preparing target collection: %w", err)
-		}
-		displayMigrationStart("pinecone", r.Pinecone.IndexName, r.Qdrant.Collection)
-		err = r.migrateDocuments(ctx, plan, targetClient, sourcePointCount)
 	} else {
 		err = r.prepareTargetCollection(ctx, sourceClient, targetClient)
-		if err != nil {
-			return fmt.Errorf("error preparing target collection: %w", err)
-		}
-		displayMigrationStart("pinecone", r.Pinecone.IndexName, r.Qdrant.Collection)
+	}
+	if err != nil {
+		return fmt.Errorf("error preparing target collection: %w", err)
+	}
+
+	displayMigrationStart("pinecone", r.Pinecone.IndexName, r.Qdrant.Collection)
+
+	if plan != nil {
+		err = r.migrateDocuments(ctx, plan, targetClient, sourcePointCount)
+	} else {
 		err = r.migrateData(ctx, sourceIndexConn, targetClient, sourcePointCount)
 	}
 	if err != nil {

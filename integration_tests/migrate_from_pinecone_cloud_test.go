@@ -34,7 +34,7 @@ func TestMigrateFromPineconeDocuments(t *testing.T) {
 	}
 
 	indexName := fmt.Sprintf("migration-test-%d", rand.Int())
-	pineconeAPI(ctx, t, apiKey, http.MethodPost, pineconeControlPlane+"/indexes", map[string]any{
+	require.NoError(t, pineconeREST(ctx, apiKey, http.MethodPost, pineconeControlPlane+"/indexes", map[string]any{
 		"name": indexName,
 		"schema": map[string]any{"fields": map[string]any{
 			"title":     map[string]any{"type": "string", "full_text_search": map[string]any{}},
@@ -42,9 +42,9 @@ func TestMigrateFromPineconeDocuments(t *testing.T) {
 			"embedding": map[string]any{"type": "dense_vector", "dimension": dimension, "metric": "cosine"},
 			"sparse":    map[string]any{"type": "sparse_vector"},
 		}},
-	}, nil)
+	}, nil))
 	t.Cleanup(func() {
-		pineconeAPI(context.WithoutCancel(ctx), t, apiKey, http.MethodDelete, pineconeControlPlane+"/indexes/"+indexName, nil, nil)
+		require.NoError(t, pineconeREST(context.WithoutCancel(ctx), apiKey, http.MethodDelete, pineconeControlPlane+"/indexes/"+indexName, nil, nil))
 	})
 
 	var index struct {
@@ -54,7 +54,7 @@ func TestMigrateFromPineconeDocuments(t *testing.T) {
 		} `json:"status"`
 	}
 	require.Eventually(t, func() bool {
-		err := pineconeTry(ctx, apiKey, http.MethodGet, pineconeControlPlane+"/indexes/"+indexName, nil, &index)
+		err := pineconeREST(ctx, apiKey, http.MethodGet, pineconeControlPlane+"/indexes/"+indexName, nil, &index)
 		return err == nil && index.Status.Ready
 	}, 5*time.Minute, 2*time.Second, "index %q is not ready", indexName)
 
@@ -77,13 +77,13 @@ func TestMigrateFromPineconeDocuments(t *testing.T) {
 		}
 	}
 	documentsURL := "https://" + index.Host + "/namespaces/__default__/documents/"
-	pineconeAPI(ctx, t, apiKey, http.MethodPost, documentsURL+"upsert", map[string]any{"documents": documents}, nil)
+	require.NoError(t, pineconeREST(ctx, apiKey, http.MethodPost, documentsURL+"upsert", map[string]any{"documents": documents}, nil))
 
 	require.Eventually(t, func() bool {
 		var stats struct {
 			TotalVectorCount int `json:"totalVectorCount"`
 		}
-		err := pineconeTry(ctx, apiKey, http.MethodPost, "https://"+index.Host+"/describe_index_stats", map[string]any{}, &stats)
+		err := pineconeREST(ctx, apiKey, http.MethodPost, "https://"+index.Host+"/describe_index_stats", map[string]any{}, &stats)
 		return err == nil && stats.TotalVectorCount == totalEntries
 	}, 2*time.Minute, 2*time.Second, "the documents of index %q are not readable", indexName)
 
@@ -270,15 +270,9 @@ func startQdrant(ctx context.Context, t *testing.T) (*qdrant.Client, string, int
 	return client, host, int(port.Num())
 }
 
-// pineconeAPI sends a request to the Pinecone REST API, which the Go client of this module does not
+// pineconeREST sends a request to the Pinecone REST API, which the Go client of this module does not
 // support for indexes with a document schema.
-func pineconeAPI(ctx context.Context, t *testing.T, apiKey, method, url string, body, out any) {
-	t.Helper()
-	require.NoError(t, pineconeTry(ctx, apiKey, method, url, body, out))
-}
-
-// pineconeTry returns the error instead of failing the test, for conditions that poll Pinecone.
-func pineconeTry(ctx context.Context, apiKey, method, url string, body, out any) error {
+func pineconeREST(ctx context.Context, apiKey, method, url string, body, out any) error {
 	var reader io.Reader
 	if body != nil {
 		payload, err := json.Marshal(body)

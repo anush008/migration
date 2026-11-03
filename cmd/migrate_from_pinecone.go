@@ -154,14 +154,9 @@ func (r *MigrateFromPineconeCmd) countPineconeVectors(ctx context.Context, index
 		return 0, fmt.Errorf("failed to get index statistics: %w", err)
 	}
 
-	// Pinecone names the default namespace "" or "__default__", depending on the API version.
-	for _, namespace := range []string{r.Pinecone.Namespace, pineconeDefaultNamespace} {
-		if summary, ok := stats.Namespaces[namespace]; ok {
-			return uint64(summary.VectorCount), nil
-		}
-		if r.Pinecone.Namespace != "" {
-			break
-		}
+	// The gRPC client names the default namespace "".
+	if summary := stats.Namespaces[r.Pinecone.Namespace]; summary != nil {
+		return uint64(summary.VectorCount), nil
 	}
 	return 0, nil
 }

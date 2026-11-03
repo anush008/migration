@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -33,6 +32,8 @@ const (
 	pineconeEmbedBatch = 96
 )
 
+var pineconeHTTPClient = &http.Client{Timeout: 2 * time.Minute}
+
 type pineconeEmbedConfig struct {
 	Model           string         `json:"model"`
 	Dimension       uint64         `json:"dimension"`
@@ -40,23 +41,21 @@ type pineconeEmbedConfig struct {
 	WriteParameters map[string]any `json:"write_parameters"`
 }
 
-type pineconeField struct {
-	Type           string               `json:"type"`
-	Dimension      uint64               `json:"dimension"`
-	Metric         string               `json:"metric"`
-	FullTextSearch json.RawMessage      `json:"full_text_search"`
-	Embed          *pineconeEmbedConfig `json:"embed"`
-	SparseEmbed    *pineconeEmbedConfig `json:"sparse_embed"`
-}
-
 type pineconeIndexDescription struct {
 	Schema *struct {
-		Fields map[string]pineconeField `json:"fields"`
+		Fields map[string]struct {
+			Type           string               `json:"type"`
+			Dimension      uint64               `json:"dimension"`
+			Metric         string               `json:"metric"`
+			FullTextSearch any                  `json:"full_text_search"`
+			Embed          *pineconeEmbedConfig `json:"embed"`
+			SparseEmbed    *pineconeEmbedConfig `json:"sparse_embed"`
+		} `json:"fields"`
 	} `json:"schema"`
 }
 
-// pineconeVectorField describes where a Qdrant vector comes from: a vector field of the document,
-// or the text of a field that Pinecone embeds itself.
+// pineconeVectorField is a Qdrant vector from a vector field of the document, or from the text of a field
+// that Pinecone embeds itself.
 type pineconeVectorField struct {
 	Field  string
 	Name   string
@@ -72,61 +71,40 @@ type pineconeDocumentPlan struct {
 }
 
 // documentPlan returns nil for an index without a document schema, which the vectors API serves.
+// Field names that start with "_" are reserved, and a vector index has only those.
 func (r *MigrateFromPineconeCmd) documentPlan(description *pineconeIndexDescription) *pineconeDocumentPlan {
 	if description.Schema == nil {
 		return nil
 	}
-	names := make([]string, 0, len(description.Schema.Fields))
-	for name := range description.Schema.Fields {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
 	plan := &pineconeDocumentPlan{}
-	var dense, sparse []pineconeVectorField
-	isDocumentSchema := false
-	for _, name := range names {
-		field := description.Schema.Fields[name]
+	for name, field := range description.Schema.Fields {
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
 		switch field.Type {
 		case "dense_vector":
-			dense = append(dense, pineconeVectorField{Field: name, Size: field.Dimension, Metric: field.Metric})
-			isDocumentSchema = isDocumentSchema || name != "_values"
+			plan.Vectors = append(plan.Vectors, pineconeVectorField{Field: name, Name: name, Size: field.Dimension, Metric: field.Metric})
 		case "sparse_vector":
-			sparse = append(sparse, pineconeVectorField{Field: name, Sparse: true})
-			isDocumentSchema = isDocumentSchema || name != "_sparse_values"
+			plan.Vectors = append(plan.Vectors, pineconeVectorField{Field: name, Name: name, Sparse: true})
 		case "string":
-			if len(field.FullTextSearch) > 0 && string(field.FullTextSearch) != "null" {
+			if field.FullTextSearch != nil {
 				plan.Text = append(plan.Text, name)
-				isDocumentSchema = true
 			}
 			if field.Embed != nil {
-				dense = append(dense, pineconeVectorField{Field: name, Embed: field.Embed, Size: field.Embed.Dimension, Metric: field.Embed.Metric})
-				isDocumentSchema = true
+				plan.Vectors = append(plan.Vectors, pineconeVectorField{Field: name, Name: name, Embed: field.Embed, Size: field.Embed.Dimension, Metric: field.Embed.Metric})
 			}
 			if field.SparseEmbed != nil {
-				sparse = append(sparse, pineconeVectorField{Field: name, Sparse: true, Embed: field.SparseEmbed})
-				isDocumentSchema = true
+				// Qdrant rejects a dense and a sparse vector with the same name.
+				sparseName := name
+				if field.Embed != nil {
+					sparseName += "_sparse"
+				}
+				plan.Vectors = append(plan.Vectors, pineconeVectorField{Field: name, Name: sparseName, Sparse: true, Embed: field.SparseEmbed})
 			}
 		}
 	}
-	if !isDocumentSchema {
+	if len(plan.Vectors) == 0 && len(plan.Text) == 0 {
 		return nil
-	}
-
-	// Each vector takes the name of its field. Qdrant rejects a dense and a sparse vector with the same name,
-	// so a sparse vector from a field that also gives a dense vector gets the suffix "_sparse".
-	denseFields := map[string]bool{}
-	for _, v := range dense {
-		v.Name = v.Field
-		denseFields[v.Field] = true
-		plan.Vectors = append(plan.Vectors, v)
-	}
-	for _, v := range sparse {
-		v.Name = v.Field
-		if denseFields[v.Field] {
-			v.Name = v.Field + "_sparse"
-		}
-		plan.Vectors = append(plan.Vectors, v)
 	}
 	return plan
 }
@@ -163,13 +141,9 @@ func (r *MigrateFromPineconeCmd) prepareDocumentCollection(ctx context.Context, 
 	for _, v := range plan.Vectors {
 		if v.Sparse {
 			sparse[v.Name] = &qdrant.SparseVectorParams{}
-			continue
+		} else {
+			dense[v.Name] = &qdrant.VectorParams{Size: v.Size, Distance: distances[v.Metric]}
 		}
-		distance, ok := distances[strings.ToLower(v.Metric)]
-		if !ok {
-			distance = qdrant.Distance_Cosine
-		}
-		dense[v.Name] = &qdrant.VectorParams{Size: v.Size, Distance: distance}
 	}
 
 	request := &qdrant.CreateCollection{CollectionName: r.Qdrant.Collection}
@@ -201,18 +175,11 @@ func (r *MigrateFromPineconeCmd) prepareDocumentCollection(ctx context.Context, 
 }
 
 func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pineconeDocumentPlan, targetClient *qdrant.Client, sourcePointCount uint64) error {
-	batchSize := min(r.Migration.BatchSize, pineconeMaxListLimit)
 	namespace := r.Pinecone.Namespace
 	if namespace == "" {
 		namespace = pineconeDefaultNamespace
 	}
 	documentsURL := pineconeBaseURL(r.Pinecone.IndexHost) + "/namespaces/" + url.PathEscape(namespace) + "/documents/"
-
-	for _, v := range plan.Vectors {
-		if v.Embed != nil && r.Pinecone.Embed == "pinecone" {
-			pterm.Info.Printfln("Pinecone does not return the vectors that it generates from '%s', so the tool embeds the text again with %s.", v.Field, v.Embed.Model)
-		}
-	}
 
 	pageToken := ""
 	offsetCount := uint64(0)
@@ -221,18 +188,15 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 		if err != nil {
 			return fmt.Errorf("failed to get start offset: %w", err)
 		}
-		if id != nil {
-			pageToken = id.GetUuid()
-		}
+		pageToken = id.GetUuid()
 		offsetCount = stored
 	}
 
 	bar, _ := pterm.DefaultProgressbar.WithTotal(int(sourcePointCount)).Start()
 	displayMigrationProgress(bar, offsetCount)
-	warnedMissing := map[string]bool{}
 
 	for {
-		listBody := map[string]any{"limit": batchSize}
+		listBody := map[string]any{"limit": min(r.Migration.BatchSize, pineconeMaxListLimit)}
 		if pageToken != "" {
 			listBody["pagination_token"] = pageToken
 		}
@@ -240,7 +204,7 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 			Documents []struct {
 				ID string `json:"_id"`
 			} `json:"documents"`
-			Pagination *struct {
+			Pagination struct {
 				Next string `json:"next"`
 			} `json:"pagination"`
 		}
@@ -251,9 +215,9 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 			break
 		}
 
-		ids := make([]string, 0, len(list.Documents))
-		for _, document := range list.Documents {
-			ids = append(ids, document.ID)
+		ids := make([]string, len(list.Documents))
+		for i, document := range list.Documents {
+			ids[i] = document.ID
 		}
 		var fetched struct {
 			Documents map[string]map[string]any `json:"documents"`
@@ -262,7 +226,7 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 			return fmt.Errorf("failed to fetch documents from Pinecone: %w", err)
 		}
 
-		points, err := r.documentsToPoints(ctx, plan, ids, fetched.Documents, warnedMissing)
+		points, err := r.documentsToPoints(ctx, plan, ids, fetched.Documents)
 		if err != nil {
 			return err
 		}
@@ -278,12 +242,9 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 		}
 
 		offsetCount += uint64(len(points))
-		next := ""
-		if list.Pagination != nil {
-			next = list.Pagination.Next
-		}
-		if next != "" {
-			if err := commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.progressKey(), qdrant.NewID(next), offsetCount); err != nil {
+		pageToken = list.Pagination.Next
+		if pageToken != "" {
+			if err := commons.StoreStartOffset(ctx, r.Migration.OffsetsCollection, targetClient, r.progressKey(), qdrant.NewID(pageToken), offsetCount); err != nil {
 				return fmt.Errorf("failed to store offset: %w", err)
 			}
 		}
@@ -292,23 +253,22 @@ func (r *MigrateFromPineconeCmd) migrateDocuments(ctx context.Context, plan *pin
 		if r.Migration.BatchDelay > 0 {
 			time.Sleep(time.Duration(r.Migration.BatchDelay) * time.Millisecond)
 		}
-		if next == "" {
+		if pageToken == "" {
 			break
 		}
-		pageToken = next
 	}
 
 	pterm.Success.Printfln("Data migration finished successfully")
 	return nil
 }
 
-// documentsToPoints keeps the fields of each document as payload, copies its vector fields, and embeds
-// the text of the fields that Pinecone embedded itself.
-func (r *MigrateFromPineconeCmd) documentsToPoints(ctx context.Context, plan *pineconeDocumentPlan, ids []string, documents map[string]map[string]any, warnedMissing map[string]bool) ([]*qdrant.PointStruct, error) {
-	vectorFields := map[string]bool{}
+// documentsToPoints keeps the fields of each document as payload and copies its vector fields.
+// With --pinecone.embed pinecone, it also embeds the text of the fields that Pinecone embedded itself.
+func (r *MigrateFromPineconeCmd) documentsToPoints(ctx context.Context, plan *pineconeDocumentPlan, ids []string, documents map[string]map[string]any) ([]*qdrant.PointStruct, error) {
+	vectorNames := map[string]string{}
 	for _, v := range plan.Vectors {
 		if v.Embed == nil {
-			vectorFields[v.Field] = true
+			vectorNames[v.Field] = v.Name
 		}
 	}
 
@@ -323,26 +283,18 @@ func (r *MigrateFromPineconeCmd) documentsToPoints(ctx context.Context, plan *pi
 		payload := map[string]any{}
 		vectors := map[string]*qdrant.Vector{}
 		for key, value := range document {
+			name, isVector := vectorNames[key]
 			switch {
-			case key == "_id":
-			case vectorFields[key] && value == nil:
-				// A null vector is a missing vector.
-			case vectorFields[key]:
+			case key == "_id", isVector && value == nil:
+			case isVector:
 				vector, err := pineconeFieldVector(value)
 				if err != nil {
 					return nil, fmt.Errorf("invalid vector field %q of document %q: %w", key, id, err)
 				}
-				for _, v := range plan.Vectors {
-					if v.Field == key && v.Embed == nil {
-						vectors[v.Name] = vector
-					}
-				}
+				vectors[name] = vector
 			default:
 				payload[key] = value
 			}
-		}
-		if _, exists := payload[r.IdField]; exists {
-			return nil, fmt.Errorf("document %q has a field named %q, set --qdrant.id-field to another name", id, r.IdField)
 		}
 		payload[r.IdField] = id
 
@@ -355,19 +307,9 @@ func (r *MigrateFromPineconeCmd) documentsToPoints(ctx context.Context, plan *pi
 	}
 
 	for _, v := range plan.Vectors {
-		if v.Embed == nil {
-			for i := range points {
-				if vectorsOf[i][v.Name] == nil && !warnedMissing[v.Field] {
-					pterm.Warning.Printfln("Some documents have no '%s' vector. Their points have no '%s' vector.", v.Field, v.Name)
-					warnedMissing[v.Field] = true
-				}
-			}
+		if v.Embed == nil || r.Pinecone.Embed != "pinecone" {
 			continue
 		}
-		if r.Pinecone.Embed == "none" {
-			continue
-		}
-
 		var texts []string
 		var owners []int
 		for i, point := range points {
@@ -385,7 +327,6 @@ func (r *MigrateFromPineconeCmd) documentsToPoints(ctx context.Context, plan *pi
 		}
 	}
 
-	// An empty map is valid: Qdrant stores a point without vectors.
 	for i, point := range points {
 		point.Vectors = qdrant.NewVectorsMap(vectorsOf[i])
 	}
@@ -502,25 +443,20 @@ func (r *MigrateFromPineconeCmd) pineconeRequest(ctx context.Context, method, ta
 	for attempt := 0; attempt < 8; attempt++ {
 		var retryable bool
 		retryable, err = r.pineconeRequestOnce(ctx, method, target, payload, out)
-		if err == nil || !retryable || ctx.Err() != nil {
+		if err == nil || !retryable {
 			return err
 		}
-		delay := min(baseRetryDelay*time.Duration(1<<attempt), 30*time.Second)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(delay):
+		case <-time.After(min(baseRetryDelay*time.Duration(1<<attempt), 30*time.Second)):
 		}
 	}
 	return err
 }
 
 func (r *MigrateFromPineconeCmd) pineconeRequestOnce(ctx context.Context, method, target string, payload []byte, out any) (bool, error) {
-	var reader io.Reader
-	if payload != nil {
-		reader = bytes.NewReader(payload)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, target, reader)
+	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(payload))
 	if err != nil {
 		return false, err
 	}
@@ -528,8 +464,7 @@ func (r *MigrateFromPineconeCmd) pineconeRequestOnce(ctx context.Context, method
 	req.Header.Set("X-Pinecone-API-Version", pineconeDocumentsAPIVersion)
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 2 * time.Minute}
-	res, err := client.Do(req)
+	res, err := pineconeHTTPClient.Do(req)
 	if err != nil {
 		// Pinecone may have embedded the texts of a request whose response was lost, so a retry uses the quota again.
 		return !strings.HasSuffix(req.URL.Path, "/embed"), err
@@ -541,12 +476,12 @@ func (r *MigrateFromPineconeCmd) pineconeRequestOnce(ctx context.Context, method
 	}
 
 	if res.StatusCode >= 300 {
-		message := strings.TrimSpace(string(data))
 		var parsed struct {
 			Error struct {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
+		message := strings.TrimSpace(string(data))
 		if json.Unmarshal(data, &parsed) == nil && parsed.Error.Message != "" {
 			message = parsed.Error.Message
 		}

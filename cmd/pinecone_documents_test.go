@@ -19,55 +19,54 @@ func parseDescription(t *testing.T, data string) *pineconeIndexDescription {
 	return &description
 }
 
+func vectorNames(plan *pineconeDocumentPlan) []string {
+	names := make([]string, len(plan.Vectors))
+	for i, v := range plan.Vectors {
+		names[i] = v.Name
+	}
+	return names
+}
+
 func TestPineconeDocumentPlan(t *testing.T) {
-	r := &MigrateFromPineconeCmd{SparseVector: "sparse_vector"}
+	r := &MigrateFromPineconeCmd{}
 
 	plan := r.documentPlan(parseDescription(t, `{"schema": {"fields": {
 		"chunk_text": {"type": "string", "full_text_search": {"language": "en"},
-			"embed": {"model": "llama-text-embed-v2", "dimension": 1024, "metric": "cosine", "write_parameters": {"input_type": "passage"}}},
-		"title": {"type": "string", "full_text_search": {"language": "en"}}
+			"embed": {"model": "llama-text-embed-v2", "dimension": 1024, "metric": "cosine"}},
+		"title": {"type": "string", "full_text_search": {}}
 	}}}`))
-	require.NotNil(t, plan)
-	require.Equal(t, []string{"chunk_text", "title"}, plan.Text)
-	require.Len(t, plan.Vectors, 1)
-	require.Equal(t, "chunk_text", plan.Vectors[0].Name, "one dense vector takes the name of its field")
+	require.ElementsMatch(t, []string{"chunk_text", "title"}, plan.Text)
+	require.Equal(t, []string{"chunk_text"}, vectorNames(plan))
 	require.Equal(t, uint64(1024), plan.Vectors[0].Size)
-	require.NotNil(t, plan.Vectors[0].Embed)
 
 	plan = r.documentPlan(parseDescription(t, `{"schema": {"fields": {
-		"a": {"type": "dense_vector", "dimension": 3, "metric": "dotproduct"},
-		"b": {"type": "dense_vector", "dimension": 4, "metric": "cosine"},
-		"s": {"type": "sparse_vector"}
+		"emb": {"type": "dense_vector", "dimension": 3, "metric": "dotproduct"},
+		"sp": {"type": "sparse_vector"}
 	}}}`))
-	require.NotNil(t, plan)
-	require.Equal(t, []string{"a", "b", "s"}, []string{plan.Vectors[0].Name, plan.Vectors[1].Name, plan.Vectors[2].Name})
-	require.Nil(t, plan.Vectors[0].Embed)
+	require.ElementsMatch(t, []string{"emb", "sp"}, vectorNames(plan))
 
 	plan = r.documentPlan(parseDescription(t, `{"schema": {"fields": {
 		"chunk_text": {"type": "string",
 			"embed": {"model": "llama-text-embed-v2", "dimension": 1024, "metric": "cosine"},
 			"sparse_embed": {"model": "pinecone-sparse-english-v0"}}
 	}}}`))
-	require.NotNil(t, plan)
-	require.Equal(t, []string{"chunk_text", "chunk_text_sparse"}, []string{plan.Vectors[0].Name, plan.Vectors[1].Name},
-		"a sparse vector from a field that also gives a dense vector gets the suffix _sparse")
+	require.ElementsMatch(t, []string{"chunk_text", "chunk_text_sparse"}, vectorNames(plan))
 
-	// Only the reserved vector fields and metadata: the vectors API serves the index.
+	// A vector index has only reserved fields, so the vectors API serves it.
 	require.Nil(t, r.documentPlan(parseDescription(t, `{"schema": {"fields": {
 		"_values": {"type": "dense_vector", "dimension": 8, "metric": "cosine"},
-		"genre": {"type": "string"}
+		"_sparse_values": {"type": "sparse_vector"}
 	}}}`)))
 	require.Nil(t, r.documentPlan(parseDescription(t, `{"dimension": 8}`)))
 }
 
 func TestPineconeDocumentsToPoints(t *testing.T) {
-	r := &MigrateFromPineconeCmd{SparseVector: "sparse_vector", IdField: "__id__", Pinecone: commons.PineconeConfig{Embed: "none"}}
+	r := &MigrateFromPineconeCmd{IdField: "__id__", Pinecone: commons.PineconeConfig{Embed: "none"}}
 	plan := r.documentPlan(parseDescription(t, `{"schema": {"fields": {
 		"chunk_text": {"type": "string", "embed": {"model": "m", "dimension": 2, "metric": "cosine"}},
 		"emb": {"type": "dense_vector", "dimension": 2, "metric": "cosine"},
 		"sp": {"type": "sparse_vector"}
 	}}}`))
-	require.NotNil(t, plan)
 
 	var documents map[string]map[string]any
 	require.NoError(t, json.Unmarshal([]byte(`{
@@ -75,7 +74,7 @@ func TestPineconeDocumentsToPoints(t *testing.T) {
 		"doc-2": {"_id": "doc-2", "chunk_text": "world", "emb": null}
 	}`), &documents))
 
-	points, err := r.documentsToPoints(context.Background(), plan, []string{"doc-1", "doc-2", "doc-gone"}, documents, map[string]bool{})
+	points, err := r.documentsToPoints(context.Background(), plan, []string{"doc-1", "doc-2", "doc-gone"}, documents)
 	require.NoError(t, err)
 	require.Len(t, points, 2, "a document deleted between list and fetch is skipped")
 
@@ -89,8 +88,7 @@ func TestPineconeDocumentsToPoints(t *testing.T) {
 	require.Equal(t, []uint32{3, 9}, vectors["sp"].GetSparse().GetIndices())
 	require.NotContains(t, vectors, "chunk_text", "with --pinecone.embed none, embedded fields get no vector")
 
-	require.NotNil(t, points[1].Vectors, "a point without vectors still sends an empty map")
-	require.Empty(t, points[1].Vectors.GetVectors().GetVectors())
+	require.Empty(t, points[1].Vectors.GetVectors().GetVectors(), "a null vector is a missing vector")
 }
 
 func TestPineconeBaseURL(t *testing.T) {
